@@ -21,6 +21,7 @@ const Spinner = () => (
 
 export default function App() {
   const [stocks, setStocks] = useState([]);
+  const [batchInfo, setBatchInfo] = useState(null);
   const [aiAnalyses, setAiAnalyses] = useState({});
   const [loading, setLoading] = useState(false);
   const [aiLoading, setAiLoading] = useState(false);
@@ -38,6 +39,7 @@ export default function App() {
     try {
       const res = await axios.get(`${API}/stocks`, { params: { min_score: minScore, limit: 50 } });
       setStocks(res.data.stocks || []);
+      setBatchInfo(res.data.batch_info || null);
       setLastUpdated(new Date(res.data.generated_at));
     } catch (e) {
       setError('銘柄データの取得に失敗しました。バックエンドが起動しているか確認してください。');
@@ -177,6 +179,29 @@ export default function App() {
             </button>
           </div>
         </div>
+
+        {/* バッチ情報バナー */}
+        {batchInfo && (
+          <div style={{
+            background: '#0f2027',
+            border: '1px solid #334155',
+            borderRadius: '10px',
+            padding: '12px 18px',
+            marginBottom: '20px',
+            display: 'flex',
+            gap: '24px',
+            flexWrap: 'wrap',
+            alignItems: 'center',
+            fontSize: '13px',
+            color: '#94a3b8',
+          }}>
+            <span style={{ color: '#38bdf8', fontWeight: 700 }}>本日のスクリーニングバッチ</span>
+            <span>バッチ <b style={{ color: '#f1f5f9' }}>{batchInfo.batch_index + 1}</b> / {batchInfo.num_batches}</span>
+            <span>対象 <b style={{ color: '#f1f5f9' }}>{batchInfo.batch_size}社</b>（全{batchInfo.total_stocks}社プール）</span>
+            <span>次の入れ替えまで <b style={{ color: '#f59e0b' }}>{batchInfo.next_rotation_in_days}日</b></span>
+            <span style={{ color: '#64748b', fontSize: '11px' }}>※ {batchInfo.batch_interval_days || 2}日ごとに自動ローテーション</span>
+          </div>
+        )}
 
         {/* エラー表示 */}
         {(error || aiError) && (
