@@ -1,9 +1,9 @@
 import yfinance as yf
-import pandas_datareader.data as pdr
 import numpy as np
 import json
+import random
 from pathlib import Path
-from datetime import date, datetime, timedelta
+from datetime import date
 import time
 import os
 from curl_cffi import requests as curl_requests
@@ -13,6 +13,8 @@ BATCH_INTERVAL_DAYS = 2
 CACHE_TTL = int(os.getenv("CACHE_TTL_SECONDS", 86400))  # デフォルト24時間
 CACHE_FILE = Path(__file__).parent.parent / "stock_cache.json"
 
+# Chrome TLSフィンガープリントを偽装したセッション
+# curl_cffi が User-Agent を含む Chrome のリクエストヘッダを自動設定する
 _curl_session = curl_requests.Session(impersonate="chrome124")
 
 # ── 銘柄プール（約200社） ─────────────────────────────────────────────────────
@@ -225,143 +227,85 @@ def _safe_float(val) -> float | None:
         return None
 
 
-def _fetch_price_bulk(tickers: list[str]) -> dict[str, dict]:
-    """stooq経由で全銘柄の価格・モメンタムを一括取得。
-    Yahoo Finance と異なりレート制限・認証不要。
-    ティッカー変換: 7203.T → 7203.JP
+def _fetch_single(ticker: str, name: str) -> dict | None:
     """
-    stooq_to_orig = {t.replace(".T", ".JP"): t for t in tickers}
-    stooq_tickers = list(stooq_to_orig.keys())
-    end = datetime.today()
-    start = end - timedelta(days=370)
-
-    try:
-        raw = pdr.get_data_stooq(stooq_tickers, start=start, end=end)
-        if raw.empty:
-            print("[WARN] stooq: データが空でした")
-            return {}
-
-        # 複数ティッカーのとき Close は MultiIndex (Close, ticker)
-        if isinstance(raw.columns, type(raw.columns)) and "Close" in raw.columns.get_level_values(0):
-            close = raw["Close"]
-        else:
-            close = raw["Close"] if "Close" in raw.columns else raw
-
-        result: dict[str, dict] = {}
-        for stooq_t, orig_t in stooq_to_orig.items():
-            try:
-                series = (close[stooq_t] if stooq_t in close.columns else close).dropna().sort_index()
-                if series.empty:
-                    continue
-                last_price = float(series.iloc[-1])
-                year_ago = float(series.iloc[0])
-                momentum = ((last_price - year_ago) / year_ago * 100) if year_ago > 0 else None
-                result[orig_t] = {
-                    "price": round(last_price, 1),
-                    "momentum_52w": round(momentum, 1) if momentum is not None else None,
-                }
-            except Exception as e:
-                print(f"[WARN] stooq {stooq_t}: {e}")
-
-        print(f"[INFO] stooq価格一括取得: {len(result)}/{len(tickers)}件成功")
-        return result
-    except Exception as e:
-        print(f"[ERROR] stooq取得失敗: {e}")
-        return {}
-
-
-def _fetch_fundamentals(ticker: str) -> dict:
-    """ticker.info から財務指標を取得。失敗時は空dict。"""
+    1銘柄分の価格・財務指標を ticker.info から取得する。
+    curl_cffi セッションが Chrome の User-Agent / TLS フィンガープリントを自動設定する。
+    """
     try:
         stock = yf.Ticker(ticker, session=_curl_session)
         info = stock.info
         if not info or len(info) < 5:
-            return {}
+            print(f"[WARN] {ticker}: 空レスポンス")
+            return None
 
         def pct(key):
             v = _safe_float(info.get(key))
             return round(v * 100, 2) if v is not None else None
 
+        # 52週モメンタムを履歴から計算
+        momentum_52w = None
+        price = _safe_float(info.get("currentPrice") or info.get("regularMarketPrice"))
+        try:
+            hist = stock.history(period="1y")
+            if len(hist) > 10 and price:
+                year_ago = float(hist["Close"].iloc[0])
+                if year_ago > 0:
+                    momentum_52w = round((price - year_ago) / year_ago * 100, 1)
+        except Exception:
+            pass
+
         return {
+            "ticker": ticker,
+            "name": name,
+            "sector": info.get("sector") or info.get("industry") or "その他",
+            "price": price,
             "market_cap": _safe_float(info.get("marketCap")),
             "per": _safe_float(info.get("trailingPE") or info.get("forwardPE")),
             "pbr": _safe_float(info.get("priceToBook")),
             "roe": pct("returnOnEquity"),
             "revenue_growth_yoy": pct("revenueGrowth"),
             "operating_margin": pct("operatingMargins"),
+            "momentum_52w": momentum_52w,
             "dividend_yield": pct("dividendYield"),
-            "sector": info.get("sector") or info.get("industry") or "その他",
         }
     except Exception as e:
-        if "429" in str(e):
-            print(f"[429] {ticker}: ファンダメンタルズ取得失敗（スキップ）")
+        if "429" in str(e) or "Expecting value" in str(e):
+            print(f"[429] {ticker}: レート制限（スキップ）")
         else:
-            print(f"[WARN] {ticker} fundamentals: {e}")
-        return {}
-
-
-def fetch_stock_metrics(ticker: str, name: str) -> dict | None:
-    # ── キャッシュ確認 ──
-    if ticker in _disk_cache:
-        return _disk_cache[ticker]
-
-    # ── 価格は呼び出し元で一括取得済みのため、ここでは fundamentals のみ ──
-    # （price/momentum は fetch_all_metrics で設定済み）
-    return None
+            print(f"[ERROR] {ticker}: {e}")
+        return None
 
 
 def fetch_all_metrics(universe: list[dict]) -> list[dict]:
-    """バッチ全銘柄を効率的に取得して返す。"""
+    """バッチ全銘柄を1件ずつランダムインターバルで取得して返す。"""
     tickers = [s["ticker"] for s in universe]
     names = {s["ticker"]: s["name"] for s in universe}
 
-    # ── キャッシュ済みを除外 ──
     to_fetch = [t for t in tickers if t not in _disk_cache]
-    cached = [_disk_cache[t] for t in tickers if t in _disk_cache]
+    results: list[dict] = [_disk_cache[t] for t in tickers if t in _disk_cache]
 
     if not to_fetch:
         print(f"[INFO] 全{len(tickers)}件キャッシュ済み")
-        return cached
+        return results
 
-    print(f"[INFO] {len(cached)}件キャッシュ済み / {len(to_fetch)}件を新規取得")
-
-    # ── Step1: 価格を一括取得（v8 API） ──
-    prices = _fetch_price_bulk(to_fetch)
-
-    # ── Step2: ファンダメンタルズを順次取得（5秒間隔） ──
-    results: list[dict] = list(cached)
+    print(f"[INFO] {len(results)}件キャッシュ済み / {len(to_fetch)}件を新規取得")
     expires_at = time.time() + CACHE_TTL
 
     for i, ticker in enumerate(to_fetch):
         if i > 0:
-            time.sleep(5)
+            wait = random.uniform(2, 5)
+            print(f"[WAIT] {wait:.1f}秒待機...")
+            time.sleep(wait)
 
-        price_data = prices.get(ticker, {})
-        fundamentals = _fetch_fundamentals(ticker)
+        entry = _fetch_single(ticker, names[ticker])
+        if entry is None:
+            continue
 
-        entry = {
-            "ticker": ticker,
-            "name": names[ticker],
-            "sector": fundamentals.get("sector") or "その他",
-            "price": price_data.get("price"),
-            "market_cap": fundamentals.get("market_cap"),
-            "per": fundamentals.get("per"),
-            "pbr": fundamentals.get("pbr"),
-            "roe": fundamentals.get("roe"),
-            "revenue_growth_yoy": fundamentals.get("revenue_growth_yoy"),
-            "operating_margin": fundamentals.get("operating_margin"),
-            "momentum_52w": price_data.get("momentum_52w"),
-            "dividend_yield": fundamentals.get("dividend_yield"),
-            "_expires_at": expires_at,
-        }
-
-        # 価格が取れた銘柄だけ返す
-        if entry["price"] is not None:
-            _disk_cache[ticker] = entry
-            results.append(entry)
-            print(f"[OK] {ticker} {names[ticker]}: ¥{entry['price']}")
-        else:
-            print(f"[SKIP] {ticker}: 価格データなし")
+        entry["_expires_at"] = expires_at
+        _disk_cache[ticker] = entry
+        results.append(entry)
+        print(f"[OK] {ticker} {names[ticker]}: ¥{entry.get('price', 'N/A')}")
 
     _save_disk_cache(_disk_cache)
     return results
