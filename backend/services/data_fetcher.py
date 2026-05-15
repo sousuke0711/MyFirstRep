@@ -1,9 +1,26 @@
 import yfinance as yf
 import numpy as np
+import requests_cache
 from cachetools import TTLCache
 from datetime import date
 import time
 import os
+
+# Yahoo Finance へのリクエストをディスクにキャッシュ（TTLはアプリ設定と合わせる）
+_http_session = requests_cache.CachedSession(
+    cache_name="yfinance_cache",
+    backend="sqlite",
+    expire_after=int(os.getenv("CACHE_TTL_SECONDS", 3600)),
+)
+_http_session.headers.update({
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json",
+    "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
+})
 
 BATCH_SIZE = 50
 BATCH_INTERVAL_DAYS = 2  # 何日ごとに入れ替えるか
@@ -210,19 +227,19 @@ def fetch_stock_metrics(ticker: str, name: str) -> dict | None:
     if cache_key in _cache:
         return _cache[cache_key]
 
-    # 429が来たらリトライ（最大3回、指数バックオフ）
+    # キャッシュ済みセッション経由で取得、429時は指数バックオフでリトライ
     for attempt in range(3):
         try:
-            stock = yf.Ticker(ticker)
+            stock = yf.Ticker(ticker, session=_http_session)
             info = stock.info
             if not info or len(info) < 5:
                 raise ValueError("empty response")
             break
         except Exception as e:
             msg = str(e)
-            if "429" in msg or "Too Many Requests" in msg:
-                wait = 10 * (2 ** attempt)  # 10s, 20s, 40s
-                print(f"[429] {ticker}: リトライまで{wait}秒待機")
+            if "429" in msg or "Too Many Requests" in msg or "Expecting value" in msg:
+                wait = 15 * (2 ** attempt)  # 15s → 30s → 60s
+                print(f"[429] {ticker}: {wait}秒待機してリトライ ({attempt+1}/3)")
                 time.sleep(wait)
                 if attempt == 2:
                     print(f"[ERROR] {ticker}: リトライ上限に達しました")

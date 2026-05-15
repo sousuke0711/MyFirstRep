@@ -1,5 +1,4 @@
 from .data_fetcher import fetch_stock_metrics, get_stock_universe
-import concurrent.futures
 import time
 
 
@@ -104,35 +103,28 @@ def _score_stock(metrics: dict) -> tuple[float, dict]:
     return round(total, 1), breakdown
 
 
-def _fetch_with_delay(ticker: str, name: str, delay: float) -> dict | None:
-    time.sleep(delay)
-    return fetch_stock_metrics(ticker, name)
-
-
 def run_screening(min_score: float = 0, sector_filter: str | None = None) -> list[dict]:
     universe = get_stock_universe()
     results = []
 
-    # Yahoo Finance の 429 対策: スレッド数を抑え、リクエストにずらしを入れる
-    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
-        futures = {
-            executor.submit(_fetch_with_delay, s["ticker"], s["name"], i * 0.8): s
-            for i, s in enumerate(universe)
-        }
-        for future in concurrent.futures.as_completed(futures):
-            metrics = future.result()
-            if metrics is None:
-                continue
+    # 完全順次実行 + 2秒間隔で 429 を回避
+    # キャッシュ済みの銘柄はネットワーク不使用なので間隔不要
+    for i, s in enumerate(universe):
+        if i > 0:
+            time.sleep(2)
+        metrics = fetch_stock_metrics(s["ticker"], s["name"])
+        if metrics is None:
+            continue
 
-            if sector_filter and sector_filter.lower() not in (metrics.get("sector") or "").lower():
-                continue
+        if sector_filter and sector_filter.lower() not in (metrics.get("sector") or "").lower():
+            continue
 
-            score, breakdown = _score_stock(metrics)
-            metrics["screening_score"] = score
-            metrics["score_breakdown"] = breakdown
+        score, breakdown = _score_stock(metrics)
+        metrics["screening_score"] = score
+        metrics["score_breakdown"] = breakdown
 
-            if score >= min_score:
-                results.append(metrics)
+        if score >= min_score:
+            results.append(metrics)
 
     results.sort(key=lambda x: x["screening_score"], reverse=True)
     return results
