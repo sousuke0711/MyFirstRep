@@ -2,6 +2,7 @@ import yfinance as yf
 import numpy as np
 from cachetools import TTLCache
 from datetime import date
+import time
 import os
 
 BATCH_SIZE = 50
@@ -209,9 +210,30 @@ def fetch_stock_metrics(ticker: str, name: str) -> dict | None:
     if cache_key in _cache:
         return _cache[cache_key]
 
+    # 429が来たらリトライ（最大3回、指数バックオフ）
+    for attempt in range(3):
+        try:
+            stock = yf.Ticker(ticker)
+            info = stock.info
+            if not info or len(info) < 5:
+                raise ValueError("empty response")
+            break
+        except Exception as e:
+            msg = str(e)
+            if "429" in msg or "Too Many Requests" in msg:
+                wait = 10 * (2 ** attempt)  # 10s, 20s, 40s
+                print(f"[429] {ticker}: リトライまで{wait}秒待機")
+                time.sleep(wait)
+                if attempt == 2:
+                    print(f"[ERROR] {ticker}: リトライ上限に達しました")
+                    return None
+            else:
+                print(f"[ERROR] {ticker}: {e}")
+                return None
+    else:
+        return None
+
     try:
-        stock = yf.Ticker(ticker)
-        info = stock.info
 
         price = _safe_float(info.get("currentPrice") or info.get("regularMarketPrice"))
         market_cap = _safe_float(info.get("marketCap"))

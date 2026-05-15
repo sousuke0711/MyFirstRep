@@ -1,5 +1,6 @@
 from .data_fetcher import fetch_stock_metrics, get_stock_universe
 import concurrent.futures
+import time
 
 
 def _score_stock(metrics: dict) -> tuple[float, dict]:
@@ -103,14 +104,20 @@ def _score_stock(metrics: dict) -> tuple[float, dict]:
     return round(total, 1), breakdown
 
 
+def _fetch_with_delay(ticker: str, name: str, delay: float) -> dict | None:
+    time.sleep(delay)
+    return fetch_stock_metrics(ticker, name)
+
+
 def run_screening(min_score: float = 0, sector_filter: str | None = None) -> list[dict]:
     universe = get_stock_universe()
     results = []
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+    # Yahoo Finance の 429 対策: スレッド数を抑え、リクエストにずらしを入れる
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
         futures = {
-            executor.submit(fetch_stock_metrics, s["ticker"], s["name"]): s
-            for s in universe
+            executor.submit(_fetch_with_delay, s["ticker"], s["name"], i * 0.8): s
+            for i, s in enumerate(universe)
         }
         for future in concurrent.futures.as_completed(futures):
             metrics = future.result()
