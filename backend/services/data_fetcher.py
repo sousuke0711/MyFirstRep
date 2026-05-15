@@ -1,26 +1,14 @@
 import yfinance as yf
 import numpy as np
-import requests_cache
 from cachetools import TTLCache
 from datetime import date
 import time
 import os
 
-# Yahoo Finance へのリクエストをディスクにキャッシュ（TTLはアプリ設定と合わせる）
-_http_session = requests_cache.CachedSession(
-    cache_name="yfinance_cache",
-    backend="sqlite",
-    expire_after=int(os.getenv("CACHE_TTL_SECONDS", 3600)),
-)
-_http_session.headers.update({
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Accept": "application/json",
-    "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
-})
+# curl_cffi で Chrome の TLS フィンガープリントを偽装し Cloudflare を回避
+# （yfinance 公式推奨の対処法）
+from curl_cffi import requests as curl_requests
+_http_session = curl_requests.Session(impersonate="chrome124")
 
 BATCH_SIZE = 50
 BATCH_INTERVAL_DAYS = 2  # 何日ごとに入れ替えるか
