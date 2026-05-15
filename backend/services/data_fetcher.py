@@ -1,8 +1,9 @@
 import yfinance as yf
+import pandas_datareader.data as pdr
 import numpy as np
 import json
 from pathlib import Path
-from datetime import date
+from datetime import date, datetime, timedelta
 import time
 import os
 from curl_cffi import requests as curl_requests
@@ -225,37 +226,47 @@ def _safe_float(val) -> float | None:
 
 
 def _fetch_price_bulk(tickers: list[str]) -> dict[str, dict]:
-    """yf.download() で全銘柄の価格・モメンタムを一括取得（v8 API）。"""
-    try:
-        raw = yf.download(
-            tickers,
-            period="1y",
-            progress=False,
-            auto_adjust=True,
-            session=_curl_session,
-        )
-        result: dict[str, dict] = {}
-        close = raw["Close"] if "Close" in raw.columns else raw
+    """stooq経由で全銘柄の価格・モメンタムを一括取得。
+    Yahoo Finance と異なりレート制限・認証不要。
+    ティッカー変換: 7203.T → 7203.JP
+    """
+    stooq_to_orig = {t.replace(".T", ".JP"): t for t in tickers}
+    stooq_tickers = list(stooq_to_orig.keys())
+    end = datetime.today()
+    start = end - timedelta(days=370)
 
-        for ticker in tickers:
+    try:
+        raw = pdr.get_data_stooq(stooq_tickers, start=start, end=end)
+        if raw.empty:
+            print("[WARN] stooq: データが空でした")
+            return {}
+
+        # 複数ティッカーのとき Close は MultiIndex (Close, ticker)
+        if isinstance(raw.columns, type(raw.columns)) and "Close" in raw.columns.get_level_values(0):
+            close = raw["Close"]
+        else:
+            close = raw["Close"] if "Close" in raw.columns else raw
+
+        result: dict[str, dict] = {}
+        for stooq_t, orig_t in stooq_to_orig.items():
             try:
-                series = close[ticker] if len(tickers) > 1 else close
-                series = series.dropna()
+                series = (close[stooq_t] if stooq_t in close.columns else close).dropna().sort_index()
                 if series.empty:
                     continue
                 last_price = float(series.iloc[-1])
                 year_ago = float(series.iloc[0])
                 momentum = ((last_price - year_ago) / year_ago * 100) if year_ago > 0 else None
-                result[ticker] = {
+                result[orig_t] = {
                     "price": round(last_price, 1),
                     "momentum_52w": round(momentum, 1) if momentum is not None else None,
                 }
-            except Exception:
-                pass
-        print(f"[INFO] 価格一括取得: {len(result)}/{len(tickers)}件成功")
+            except Exception as e:
+                print(f"[WARN] stooq {stooq_t}: {e}")
+
+        print(f"[INFO] stooq価格一括取得: {len(result)}/{len(tickers)}件成功")
         return result
     except Exception as e:
-        print(f"[ERROR] 価格一括取得失敗: {e}")
+        print(f"[ERROR] stooq取得失敗: {e}")
         return {}
 
 
